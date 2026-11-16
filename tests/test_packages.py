@@ -2,8 +2,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from packsmith import Repository
-from packsmith.formats import IntegrityError, digest, encode
+from packsmith import AuthenticationError, IntegrityError, Repository
+from packsmith.formats import digest, encode, sign_manifest
+
+KEY = bytes.fromhex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+KEYS = {"main": KEY}
 
 
 class PackageTests(unittest.TestCase):
@@ -16,7 +19,7 @@ class PackageTests(unittest.TestCase):
         (self.source / "empty").touch()
         (self.source / "nested").mkdir()
         (self.source / "nested" / "schema.json").write_text('{"v":1}')
-        self.repo = Repository(self.root / "repo")
+        self.repo = Repository(self.root / "repo", keys=KEYS, sign_with="main")
         self.addCleanup(self.tmp.cleanup)
 
     def test_roundtrip_and_integrity(self):
@@ -25,6 +28,7 @@ class PackageTests(unittest.TestCase):
         destination = self.root / "out"
         result = self.repo.restore(sid, destination)
         self.assertEqual(result["files"], 3)
+        self.assertTrue(result["authenticated"])
         for path in self.source.rglob("*"):
             if path.is_file():
                 self.assertEqual(path.read_bytes(), (destination / path.relative_to(self.source)).read_bytes())
@@ -38,6 +42,7 @@ class PackageTests(unittest.TestCase):
             self.repo.restore(sid, self.root / "out", progress=interrupt)
         self.assertFalse((self.root / "out" / "data.bin").exists())
         result = self.repo.restore(sid, self.root / "out")
+        self.assertTrue(result["resumed"])
         self.assertEqual(result["chunks_reused"], 2)
 
     def test_delta_references_base_and_restores_full_snapshot(self):
@@ -70,10 +75,24 @@ class PackageTests(unittest.TestCase):
         self.assertFalse((self.root / "out" / "data.bin").exists())
         self.assertTrue((self.root / "out" / "nested" / "schema.json").exists())
 
-    def test_manifest_traversal_is_rejected_even_with_valid_hash(self):
+    def test_tampered_manifest_is_rejected_even_with_valid_hash(self):
         sid = self.repo.snapshot(self.source)
         manifest = self.repo.load(sid)
         manifest["files"]["../escaped"] = manifest["files"].pop("data.bin")
+        content = encode(manifest)
+        bad_id = digest(content)
+        (self.repo.root / "manifests" / (bad_id + ".json")).write_bytes(content)
+        # The MAC no longer matches: authentication fails before any validation.
+        with self.assertRaises(AuthenticationError):
+            self.repo.restore(bad_id, self.root / "out")
+
+    def test_signed_manifest_with_traversal_path_is_rejected(self):
+        # Defense in depth: even a validly signed manifest (compromised or
+        # buggy signer) must not smuggle unsafe paths through validation.
+        sid = self.repo.snapshot(self.source)
+        manifest = self.repo.load(sid)
+        manifest["files"]["../escaped"] = manifest["files"].pop("data.bin")
+        sign_manifest(manifest, "main", KEY)
         content = encode(manifest)
         bad_id = digest(content)
         (self.repo.root / "manifests" / (bad_id + ".json")).write_bytes(content)
